@@ -77,3 +77,75 @@ jobs:
       - name: Container aufräumen
         if: always()
         run: docker compose down -v
+
+  deploy:
+    needs: images
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    env:
+      IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26.13.0
+      - name: Live-Adresse ermitteln
+        env:
+          LIVE_DOMAIN_VAR: ${{ vars.LIVE_DOMAIN }}
+        run: |
+          if [ -z "$LIVE_DOMAIN_VAR" ]; then
+            echo "Variable LIVE_DOMAIN fehlt" >&2
+            exit 1
+          fi
+          RUN_ID="${GITHUB_REPOSITORY#*/levelboard-}"
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          echo "LIVE_URL=https://$RUN_ID.$LIVE_DOMAIN_VAR" >> "$GITHUB_ENV"
+      - name: SSH vorbereiten
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Auf dem Server ausrollen
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          SSH_OPTS="-i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          TARGET="$DEPLOY_USER@$DEPLOY_HOST"
+          ssh $SSH_OPTS "$TARGET" "mkdir -p ~/runs/$RUN_ID"
+          scp $SSH_OPTS deploy/compose.yml "$TARGET:~/runs/$RUN_ID/compose.yml"
+          printf 'RUN_ID=%s\nIMAGE_PREFIX=%s\nIMAGE_TAG=%s\n' "$RUN_ID" "$IMAGE_PREFIX" "$IMAGE_TAG" > "$RUNNER_TEMP/env"
+          scp $SSH_OPTS "$RUNNER_TEMP/env" "$TARGET:~/runs/$RUN_ID/.env"
+          ssh $SSH_OPTS "$TARGET" "cd ~/runs/$RUN_ID && docker compose pull -q && docker compose up -d --wait --remove-orphans"
+      - name: Warten, bis der aktuelle Commit live läuft
+        run: |
+          for i in $(seq 36); do
+            if curl -fsS "$LIVE_URL/api/health" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.exit(JSON.parse(s).commit===process.env.IMAGE_TAG?0:1)}catch{process.exit(1)}})'; then
+              echo "Commit ist live"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Commit wurde nicht innerhalb von 180 s live" >&2
+          exit 1
+      - name: Report-Artefakt laden
+        uses: actions/download-artifact@v8
+        with:
+          name: levelboard-report
+          path: report
+      - name: Ergebnisse an die Live-API melden
+        run: node checks/report-live.mjs report/frontend/dist/results.json "$LIVE_URL"
+      - name: Live-Seite prüfen
+        run: |
+          curl -fsS -o /dev/null "$LIVE_URL/"
+          curl -fsS "$LIVE_URL/config.json" | grep -q '"api"'
