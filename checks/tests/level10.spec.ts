@@ -24,7 +24,7 @@ function head(): string {
 async function routeLevels(page: import('@playwright/test').Page, levels: unknown) {
   await page.route(
     (url) => new URL(url).pathname === '/api/levels',
-    (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ run: await currentRun(), levels }) }),
+    async (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ run: await currentRun(), levels }) }),
   );
 }
 
